@@ -1,0 +1,215 @@
+#VRML_SIM R2025a utf8
+# Webots MCP demo world: floor, some objects, a simple differential-drive robot,
+# and the MCP bridge supervisor. No external PROTOs -> works fully offline.
+
+WorldInfo {
+  info [
+    "Webots MCP demo world"
+  ]
+  basicTimeStep 32
+}
+Viewpoint {
+  position 1.8 -1.8 1.4
+  orientation -0.2328 0.09643 0.96773 2.37912
+}
+Background {
+  skyColor [
+    0.55 0.75 0.95
+  ]
+}
+DirectionalLight {
+  direction -0.4 -0.5 -1
+  intensity 2.5
+  castShadows TRUE
+}
+DEF FLOOR Solid {
+  translation 0 0 -0.05
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.75 0.75 0.72
+        roughness 0.9
+        metalness 0
+      }
+      geometry Box {
+        size 6 6 0.1
+      }
+    }
+  ]
+  name "floor"
+  boundingObject Box {
+    size 6 6 0.1
+  }
+}
+DEF RED_BOX Solid {
+  translation 0.6 0.3 0.1
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.9 0.1 0.1
+        roughness 0.6
+        metalness 0
+      }
+      geometry Box {
+        size 0.2 0.2 0.2
+      }
+    }
+  ]
+  name "red box"
+  boundingObject Box {
+    size 0.2 0.2 0.2
+  }
+  physics Physics {
+  }
+}
+DEF GREEN_BALL Solid {
+  translation -0.5 0.5 0.15
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.1 0.8 0.2
+        roughness 0.4
+        metalness 0
+      }
+      geometry Sphere {
+        radius 0.12
+      }
+    }
+  ]
+  name "green ball"
+  boundingObject Sphere {
+    radius 0.12
+  }
+  physics Physics {
+  }
+}
+DEF DEMO_BOT Robot {
+  translation 0 -0.6 0.06
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.2 0.3 0.9
+        roughness 0.5
+        metalness 0
+      }
+      geometry Box {
+        size 0.2 0.14 0.06
+      }
+    }
+    HingeJoint {
+      jointParameters HingeJointParameters {
+        axis 0 1 0
+        anchor 0 0.09 0
+      }
+      device [
+        RotationalMotor {
+          name "left wheel motor"
+          maxVelocity 15
+        }
+        PositionSensor {
+          name "left wheel sensor"
+        }
+      ]
+      endPoint Solid {
+        translation 0 0.09 0
+        rotation 1 0 0 1.5708
+        children [
+          DEF WHEEL_SHAPE Shape {
+            appearance PBRAppearance {
+              baseColor 0.15 0.15 0.15
+              roughness 0.8
+              metalness 0
+            }
+            geometry Cylinder {
+              height 0.02
+              radius 0.05
+            }
+          }
+        ]
+        name "left wheel"
+        boundingObject USE WHEEL_SHAPE
+        physics Physics {
+        }
+      }
+    }
+    HingeJoint {
+      jointParameters HingeJointParameters {
+        axis 0 1 0
+        anchor 0 -0.09 0
+      }
+      device [
+        RotationalMotor {
+          name "right wheel motor"
+          maxVelocity 15
+        }
+        PositionSensor {
+          name "right wheel sensor"
+        }
+      ]
+      endPoint Solid {
+        translation 0 -0.09 0
+        rotation 1 0 0 1.5708
+        children [
+          USE WHEEL_SHAPE
+        ]
+        name "right wheel"
+        boundingObject USE WHEEL_SHAPE
+        physics Physics {
+        }
+      }
+    }
+    DistanceSensor {
+      translation 0.1 0 0
+      name "front distance sensor"
+      lookupTable [
+        0 0 0
+        1 1000 0
+      ]
+    }
+    Camera {
+      translation 0.1 0 0.04
+      name "front camera"
+      width 320
+      height 240
+    }
+    GPS {
+      name "gps"
+    }
+    LED {
+      translation 0 0 0.04
+      children [
+        Shape {
+          appearance PBRAppearance {
+            baseColor 0.5 0.5 0.5
+            roughness 0.5
+            metalness 0
+          }
+          geometry Sphere {
+            radius 0.015
+          }
+        }
+      ]
+      name "led"
+      color [
+        1 0 0
+        0 1 0
+        0 0 1
+      ]
+    }
+  ]
+  name "demo_bot"
+  boundingObject Box {
+    size 0.2 0.14 0.06
+  }
+  physics Physics {
+    density -1
+    mass 0.8
+  }
+  controller "mcp_robot"
+}
+DEF MCP_BRIDGE Robot {
+  translation 0 0 -10
+  name "mcp_bridge"
+  controller "mcp_bridge"
+  supervisor TRUE
+}

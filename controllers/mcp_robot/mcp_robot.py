@@ -454,22 +454,26 @@ class Agent:
                                      "to lidar axis (negative = left); null = clear")
         if p.get("include_point_cloud"):
             try:
+                # getPointCloud() returns [] until tracking is enabled, then
+                # all-zero points until a couple of steps have populated the
+                # buffer; enable and step until the points are actually valid.
+                dev.enablePointCloud()
                 pts = dev.getPointCloud()
+
+                def _valid(ps):
+                    return any(q.x * q.x + q.y * q.y + q.z * q.z > 1e-9 for q in ps)
+
+                tries = 0
+                while (not pts or not _valid(pts)) and tries < 3:
+                    self.robot.step(self.timestep)
+                    pts = dev.getPointCloud()
+                    tries += 1
                 k = max(1, len(pts) // int(p.get("max_points", 72)))
                 out["point_cloud"] = [[round(q.x, 3), round(q.y, 3), round(q.z, 3)]
                                       for q in pts[::k]
                                       if q.x == q.x and abs(q.x) != float("inf")]
-            except Exception as exc:  # noqa: BLE001 - point cloud must be enabled/supported
-                try:
-                    dev.enablePointCloud()
-                    self.robot.step(self.timestep)
-                    pts = dev.getPointCloud()
-                    k = max(1, len(pts) // int(p.get("max_points", 72)))
-                    out["point_cloud"] = [[round(q.x, 3), round(q.y, 3), round(q.z, 3)]
-                                          for q in pts[::k]
-                                          if q.x == q.x and abs(q.x) != float("inf")]
-                except Exception:  # noqa: BLE001
-                    out["point_cloud_error"] = str(exc)
+            except Exception as exc:  # noqa: BLE001 - point cloud must be supported
+                out["point_cloud_error"] = str(exc)
         return out
 
     def cmd_play_motion(self, p):

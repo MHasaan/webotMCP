@@ -16,6 +16,7 @@ class FakeMCP:
     def __init__(self):
         self.tools = {}
         self.resources = {}
+        self.prompts = {}
 
     def tool(self):
         def deco(fn):
@@ -26,6 +27,12 @@ class FakeMCP:
     def resource(self, uri):
         def deco(fn):
             self.resources[uri] = fn
+            return fn
+        return deco
+
+    def prompt(self):
+        def deco(fn):
+            self.prompts[fn.__name__] = fn
             return fn
         return deco
 

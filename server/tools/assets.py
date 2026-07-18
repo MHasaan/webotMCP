@@ -243,15 +243,20 @@ DEF FLOOR Solid {{
                 import winreg
                 key_path = _windows_pref_key()
                 prefs = {}
-                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as key:
-                    i = 0
-                    while True:
-                        try:
+
+                def _read_values(path, prefix):
+                    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path) as key:
+                        n_sub, n_val, _ = winreg.QueryInfoKey(key)
+                        for i in range(n_val):
                             name, value, _ = winreg.EnumValue(key, i)
-                            prefs[name] = value
-                            i += 1
-                        except OSError:
-                            break
+                            prefs[f"{prefix}{name}"] = value
+                        for j in range(n_sub):
+                            sub = winreg.EnumKey(key, j)
+                            _read_values(f"{path}\\{sub}", f"{prefix}{sub}/")
+
+                # Qt stores each preference group (General, OpenGL, ...) as a subkey;
+                # flatten to 'Group/name' to match set_webots_preference and Linux.
+                _read_values(key_path, "")
                 return {"source": f"HKCU\\{key_path}", "preferences": prefs}
             conf = _linux_pref_file()
             import configparser
@@ -271,9 +276,11 @@ DEF FLOOR Solid {{
         if sys.platform == "win32":
             import winreg
             key_path = _windows_pref_key()
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0,
-                                winreg.KEY_SET_VALUE) as key:
-                winreg.SetValueEx(key, name, 0, winreg.REG_SZ, str(value))
+            # 'Group/name' maps to the subkey 'Group' + value 'name' (Qt layout).
+            group, sep, leaf = name.rpartition("/")
+            full_path = f"{key_path}\\{group}" if sep else key_path
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, full_path) as key:
+                winreg.SetValueEx(key, leaf, 0, winreg.REG_SZ, str(value))
         else:
             conf = _linux_pref_file()
             import configparser

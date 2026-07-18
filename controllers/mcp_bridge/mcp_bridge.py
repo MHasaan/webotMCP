@@ -43,6 +43,14 @@ for _home in filter(None, (os.environ.get("WEBOTS_HOME"),
 
 from controller import Supervisor, Node, Field  # noqa: E402
 
+# scene_math / run_analysis live next to this controller; make them importable.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import scene_math  # noqa: E402
+import run_analysis  # noqa: E402
+import authoring  # noqa: E402
+import experiments  # noqa: E402
+import perception  # noqa: E402
+
 COMMAND_PORT = int(os.environ.get("WEBOTS_MCP_PORT", "10022"))
 AGENT_PORT = int(os.environ.get("WEBOTS_MCP_AGENT_PORT", "10023"))
 MAX_FRAME = 64 * 1024 * 1024
@@ -178,6 +186,7 @@ class Bridge:
         self.logical_mode = "realtime"
         # motion/interaction tracking state
         self.tracking = None  # {"nodes": {id: {"node", "name", "buf"}}, "sample_every", "events", "prev_contacts", "count"}
+        self._contact_tracked = set()  # node ids with contact-points tracking enabled
         self.commands = queue.Queue()  # (request dict, reply callable)
         self.agents = {}  # robot name -> {"sock": socket, "lock": Lock}
         self._start_server(COMMAND_PORT, self._client_thread)
@@ -330,6 +339,7 @@ class Bridge:
         for nid, entry in tr["nodes"].items():
             node = entry["node"]
             try:
+                self._ensure_contact_tracking(node)
                 pos = node.getPosition()
                 vel = node.getVelocity()
                 speed = math.sqrt(sum(v * v for v in vel[:3]))
@@ -563,14 +573,975 @@ class Bridge:
         return info
 
     # ======================================================================
+    # Geometry / semantic-scene helpers (P7)
+    # ======================================================================
+
+    def _yaw_from_orientation(self, node):
+        """Rotation about the world vertical axis (rad), or None."""
+        try:
+            o = node.getOrientation()  # 3x3 row-major
+            return round(math.atan2(o[3], o[0]), 4)
+        except Exception:  # noqa: BLE001
+            return None
+
+    @staticmethod
+    def _geo_field(geo, name, default=None):
+        f = geo.getField(name)
+        if f is None:
+            return default
+        try:
+            t = f.getType()
+            if t == Field.SF_FLOAT:
+                return f.getSFFloat()
+            if t == Field.SF_VEC3F:
+                return f.getSFVec3f()
+            if t == Field.SF_VEC2F:
+                return f.getSFVec2f()
+        except Exception:  # noqa: BLE001
+            return default
+        return default
+
+    def _geometry_extents(self, geo):
+        """Local half-extents [hx,hy,hz] of a geometry node, or None.
+        Approximate: Cylinder/Capsule assumed y-axis aligned (Webots default)."""
+        if geo is None:
+            return None
+        t = geo.getTypeName()
+        if t == "Box":
+            s = self._geo_field(geo, "size", [0, 0, 0]) or [0, 0, 0]
+            return [abs(s[0]) / 2, abs(s[1]) / 2, abs(s[2]) / 2]
+        if t == "Sphere":
+            r = self._geo_field(geo, "radius", 0.0) or 0.0
+            return [r, r, r]
+        if t in ("Cylinder", "Capsule"):
+            r = self._geo_field(geo, "radius", 0.0) or 0.0
+            h = self._geo_field(geo, "height", 0.0) or 0.0
+            return [r, h / 2, r]
+        if t == "Plane":
+            s = self._geo_field(geo, "size", [1, 1]) or [1, 1]
+            return [abs(s[0]) / 2, abs(s[1]) / 2, 0.0]
+        return None
+
+    @staticmethod
+    def _shape_geometry(shape):
+        f = shape.getField("geometry")
+        if f and f.getType() == Field.SF_NODE:
+            return f.getSFNode()
+        return None
+
+    def _extents_from_bounding(self, bo, depth=0):
+        """Half-extents from a boundingObject subtree (Shape/geometry/Group/Pose)."""
+        if bo is None or depth > 4:
+            return None
+        ext = self._geometry_extents(bo)
+        if ext:
+            return ext
+        if bo.getBaseTypeName() == "Shape":
+            return self._geometry_extents(self._shape_geometry(bo))
+        f = bo.getField("children")
+        if f and f.getType() == Field.MF_NODE and f.getCount():
+            return self._extents_from_bounding(f.getMFNode(0), depth + 1)
+        f = bo.getField("geometry")
+        if f and f.getType() == Field.SF_NODE and f.getSFNode():
+            return self._geometry_extents(f.getSFNode())
+        return None
+
+    def _node_extents(self, node):
+        """Local half-extents from boundingObject, else first Shape geometry."""
+        bo = node.getField("boundingObject")
+        if bo and bo.getType() == Field.SF_NODE and bo.getSFNode():
+            ext = self._extents_from_bounding(bo.getSFNode())
+            if ext:
+                return ext
+        for _, child in self._child_nodes(node):
+            if child.getBaseTypeName() == "Shape":
+                ext = self._geometry_extents(self._shape_geometry(child))
+                if ext:
+                    return ext
+        return None
+
+    def _world_aabb(self, node):
+        """Approximate world-frame AABB (min, max) from local extents + pose, or None."""
+        ext = self._node_extents(node)
+        if ext is None:
+            return None
+        try:
+            pos = node.getPosition()
+            o = node.getOrientation()
+        except Exception:  # noqa: BLE001
+            return None
+        hx, hy, hz = ext
+        wx = abs(o[0]) * hx + abs(o[1]) * hy + abs(o[2]) * hz
+        wy = abs(o[3]) * hx + abs(o[4]) * hy + abs(o[5]) * hz
+        wz = abs(o[6]) * hx + abs(o[7]) * hy + abs(o[8]) * hz
+        return ([pos[0] - wx, pos[1] - wy, pos[2] - wz],
+                [pos[0] + wx, pos[1] + wy, pos[2] + wz])
+
+    @staticmethod
+    def _aabb_overlap(a, b):
+        return all(a[0][i] <= b[1][i] and b[0][i] <= a[1][i] for i in range(3))
+
+    def _node_color(self, node):
+        """Best-effort RGB color from recognitionColors or a Shape appearance."""
+        rc = node.getField("recognitionColors")
+        if rc and rc.getType() == Field.MF_COLOR and rc.getCount():
+            return [round(v, 3) for v in rc.getMFColor(0)]
+        for n in self._iter_nodes(node, max_depth=4):
+            if n.getBaseTypeName() != "Shape":
+                continue
+            appf = n.getField("appearance")
+            app = appf.getSFNode() if appf and appf.getType() == Field.SF_NODE else None
+            if app is None:
+                continue
+            bc = app.getField("baseColor")
+            if bc and bc.getType() == Field.SF_COLOR:
+                try:
+                    return [round(v, 3) for v in bc.getSFColor()]
+                except Exception:  # noqa: BLE001
+                    pass
+            mat = app.getField("material")
+            if mat and mat.getType() == Field.SF_NODE and mat.getSFNode():
+                dc = mat.getSFNode().getField("diffuseColor")
+                if dc and dc.getType() == Field.SF_COLOR:
+                    try:
+                        return [round(v, 3) for v in dc.getSFColor()]
+                    except Exception:  # noqa: BLE001
+                        pass
+        return None
+
+    def _node_mass_kind(self, node):
+        """(mass_or_None, 'static'|'dynamic') from the Physics node."""
+        pf = node.getField("physics")
+        if not (pf and pf.getType() == Field.SF_NODE and pf.getSFNode()):
+            return None, "static"
+        mf = pf.getSFNode().getField("mass")
+        try:
+            mass = mf.getSFFloat() if mf else -1.0
+        except Exception:  # noqa: BLE001
+            mass = -1.0
+        return (round(mass, 4) if mass and mass > 0 else None), "dynamic"
+
+    def _catalog_entry(self, node):
+        s = self._node_summary(node)
+        entry = {"id": node.getId(), "name": s.get("name"), "def": s.get("def"),
+                 "type": node.getTypeName(), "base_type": node.getBaseTypeName()}
+        try:
+            entry["position"] = [round(v, 4) for v in node.getPosition()]
+        except Exception:  # noqa: BLE001
+            entry["position"] = None
+        entry["yaw"] = self._yaw_from_orientation(node)
+        ext = self._node_extents(node)
+        entry["size"] = [round(2 * e, 4) for e in ext] if ext else None
+        mass, kind = self._node_mass_kind(node)
+        entry["mass"] = mass
+        entry["kind"] = kind
+        entry["color"] = self._node_color(node)
+        par = node.getParentNode()
+        entry["parent"] = par.getId() if par else None
+        return entry
+
+    def _catalog_nodes(self, max_depth=3):
+        out = []
+        for node in self._iter_nodes(self.sup.getRoot(), max_depth=max_depth):
+            base = node.getBaseTypeName()
+            if base not in ("Solid", "Robot"):
+                continue
+            nm = node.getField("name")
+            if base == "Robot" and nm and nm.getSFString() == "mcp_bridge":
+                continue
+            out.append(node)
+        return out
+
+    def _ensure_contact_tracking(self, node, include_descendants=True):
+        """R2025a only populates getContactPoints() after tracking is enabled;
+        enable it once per node (idempotent) so contact queries actually work."""
+        try:
+            nid = node.getId()
+        except Exception:  # noqa: BLE001
+            return
+        if nid in self._contact_tracked:
+            return
+        try:
+            node.enableContactPointsTracking(self.timestep, bool(include_descendants))
+            self._contact_tracked.add(nid)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _contact_partners(self, node):
+        """Summarize contacts as [{other_node_id, other_name, points}]."""
+        self._ensure_contact_tracking(node)
+        try:
+            pts = node.getContactPoints(True)
+        except Exception:  # noqa: BLE001
+            return []
+        seen = {}
+        for cp in pts:
+            nid = getattr(cp, "node_id", None)
+            info = seen.setdefault(nid, {"other_node_id": nid, "points": 0})
+            info["points"] += 1
+        for nid, info in seen.items():
+            other = self.sup.getFromId(nid) if nid else None
+            if other:
+                nm = other.getField("name")
+                info["other_name"] = ((nm.getSFString() if nm else None)
+                                      or other.getDef() or other.getTypeName())
+        return list(seen.values())
+
+    # ======================================================================
+    # Commands: semantic scene model (P7) & contacts (P2)
+    # ======================================================================
+
+    def cmd_get_contact_points(self, p):
+        node = self.find_node(p["node"])
+        include = bool(p.get("include_descendants", False))
+        # R2025a needs tracking enabled before points populate; enable then step
+        # one timestep so the query reflects the contacts touching "right now".
+        newly = node.getId() not in self._contact_tracked
+        self._ensure_contact_tracking(node, include)
+        if newly:
+            # one step so the just-enabled tracker captures current contacts
+            self.sup.step(self.timestep)
+            self._sample_tracking()
+        try:
+            pts = node.getContactPoints(include)
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(f"getContactPoints failed: {exc}")
+        result = []
+        for cp in pts:
+            entry = {"point": [round(v, 4) for v in cp.point]}
+            nid = getattr(cp, "node_id", None)
+            if nid is not None:
+                entry["other_node_id"] = nid
+                other = self.sup.getFromId(nid)
+                if other:
+                    nm = other.getField("name")
+                    entry["other_name"] = ((nm.getSFString() if nm else None)
+                                           or other.getDef() or other.getTypeName())
+            result.append(entry)
+        return {"node": self._node_summary(node), "count": len(result),
+                "contact_points": result}
+
+    def cmd_get_object_catalog(self, p):
+        max_depth = int(p.get("max_depth", 3))
+        nodes = self._catalog_nodes(max_depth)
+        total = len(nodes)
+        cursor = int(p.get("cursor", 0))
+        page_size = p.get("page_size")
+        page = nodes[cursor:cursor + int(page_size)] if page_size else nodes
+        out = {"objects": [self._catalog_entry(n) for n in page],
+               "count": len(page), "total": total}
+        if page_size and cursor + int(page_size) < total:
+            out["next_cursor"] = cursor + int(page_size)
+        return out
+
+    def cmd_get_object_properties(self, p):
+        node = self.find_node(p["node"])
+        entry = self._catalog_entry(node)
+        aabb = self._world_aabb(node)
+        if aabb:
+            entry["aabb"] = {"min": [round(v, 4) for v in aabb[0]],
+                             "max": [round(v, 4) for v in aabb[1]]}
+        try:
+            entry["velocity"] = [round(v, 4) for v in node.getVelocity()]
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            entry["center_of_mass"] = [round(v, 4) for v in node.getCenterOfMass()]
+            entry["statically_balanced"] = bool(node.getStaticBalance())
+        except Exception:  # noqa: BLE001
+            pass
+        entry["contacts"] = self._contact_partners(node)
+        devf = node.getField("controller")
+        if devf is not None:
+            devices = []
+            for _, child in self._child_nodes(node):
+                dn = child.getField("name")
+                devices.append({"type": child.getTypeName(),
+                                "name": dn.getSFString() if dn else None})
+            entry["is_robot"] = True
+            entry["devices"] = devices
+        return entry
+
+    def _spatial_catalog(self, max_depth=3):
+        """[(node, entry, aabb)] for spatial queries."""
+        rows = []
+        for node in self._catalog_nodes(max_depth):
+            rows.append((node, self._catalog_entry(node), self._world_aabb(node)))
+        return rows
+
+    def cmd_find_nodes_near(self, p):
+        center = self._resolve_point(p.get("point") if p.get("point") is not None
+                                     else p["node"])
+        radius = float(p["radius"])
+        exclude = None
+        if p.get("node") is not None and p.get("point") is None:
+            exclude = self.find_node(p["node"]).getId()
+        found = []
+        for node, entry, _ in self._spatial_catalog():
+            if node.getId() == exclude or entry["position"] is None:
+                continue
+            d = math.dist(entry["position"], center)
+            if d <= radius:
+                e = dict(entry)
+                e["distance"] = round(d, 4)
+                found.append(e)
+        found.sort(key=lambda e: e["distance"])
+        return {"center": [round(v, 4) for v in center], "radius": radius,
+                "count": len(found), "nodes": found}
+
+    def cmd_objects_in_region(self, p):
+        mn = [float(v) for v in p["min"]]
+        mx = [float(v) for v in p["max"]]
+        found = []
+        for _, entry, _ in self._spatial_catalog():
+            pos = entry["position"]
+            if pos and all(mn[i] <= pos[i] <= mx[i] for i in range(3)):
+                found.append(entry)
+        return {"min": mn, "max": mx, "count": len(found), "nodes": found}
+
+    def cmd_check_overlap(self, p):
+        a = self.find_node(p["node_a"])
+        b = self.find_node(p["node_b"])
+        aabb_a, aabb_b = self._world_aabb(a), self._world_aabb(b)
+        if aabb_a is None or aabb_b is None:
+            return {"overlap": None,
+                    "error": "AABB unavailable for one or both nodes"}
+        return {"node_a": self._node_summary(a), "node_b": self._node_summary(b),
+                "aabb_a": {"min": aabb_a[0], "max": aabb_a[1]},
+                "aabb_b": {"min": aabb_b[0], "max": aabb_b[1]},
+                "overlap": self._aabb_overlap(aabb_a, aabb_b),
+                "note": "approximate axis-aligned bounding-box test"}
+
+    def cmd_find_overlapping_pairs(self, p):
+        rows = [(e, a) for _, e, a in self._spatial_catalog() if a is not None]
+        pairs = []
+        for i in range(len(rows)):
+            for j in range(i + 1, len(rows)):
+                if self._aabb_overlap(rows[i][1], rows[j][1]):
+                    pairs.append({"a": rows[i][0]["id"], "a_name": rows[i][0]["name"] or rows[i][0]["def"],
+                                  "b": rows[j][0]["id"], "b_name": rows[j][0]["name"] or rows[j][0]["def"]})
+        return {"count": len(pairs), "pairs": pairs,
+                "note": "approximate axis-aligned bounding-box test"}
+
+    def cmd_get_spatial_relations(self, p):
+        near_thresh = float(p.get("near_threshold", 0.5))
+        rows = self._spatial_catalog()
+        if p.get("node") is not None:
+            target_id = self.find_node(p["node"]).getId()
+            rows = [r for r in rows if r[0].getId() == target_id] + \
+                   [r for r in rows if r[0].getId() != target_id]
+            focus = {target_id}
+        else:
+            focus = None
+        relations = []
+        for i, (na, ea, aa) in enumerate(rows):
+            if focus is not None and na.getId() not in focus:
+                continue
+            contacts = {c["other_node_id"] for c in self._contact_partners(na)}
+            for nb, eb, ab in rows:
+                if nb.getId() == na.getId():
+                    continue
+                rel = []
+                if nb.getId() in contacts:
+                    rel.append("touching")
+                    if aa and ab and aa[0][2] > ab[0][2] + 1e-3:
+                        rel.append("on_top_of")
+                if aa and ab and self._aabb_contains(ab, aa):
+                    rel.append("inside")
+                if ea["position"] and eb["position"]:
+                    d = math.dist(ea["position"], eb["position"])
+                    if d <= near_thresh and not rel:
+                        rel.append("near")
+                    if rel:
+                        relations.append({"a": ea["name"] or ea["def"] or ea["id"],
+                                          "b": eb["name"] or eb["def"] or eb["id"],
+                                          "relations": rel, "distance": round(d, 4)})
+        return {"count": len(relations), "relations": relations,
+                "near_threshold": near_thresh}
+
+    @staticmethod
+    def _aabb_contains(outer, inner):
+        return all(outer[0][i] <= inner[0][i] and inner[1][i] <= outer[1][i]
+                   for i in range(3))
+
+    def cmd_reset_node_physics(self, p):
+        node = self.find_node(p["node"])
+        node.resetPhysics()
+        return {"reset_physics": self._node_summary(node)}
+
+    # ======================================================================
+    # Commands: world building (P8) & map/diff (P7)
+    # ======================================================================
+
+    @staticmethod
+    def _region(p_region):
+        """Accept {'min':..,'max':..} or [min,max]."""
+        if isinstance(p_region, dict):
+            return (p_region["min"], p_region["max"])
+        return (p_region[0], p_region[1])
+
+    def _size_of(self, node):
+        ext = self._node_extents(node)
+        return [round(2 * e, 5) for e in ext] if ext else None
+
+    def _apply_move(self, node, position=None, yaw=None, reset=True):
+        if position is not None:
+            f = node.getField("translation")
+            if f:
+                f.setSFVec3f([float(v) for v in position])
+        if yaw is not None:
+            f = node.getField("rotation")
+            if f:
+                f.setSFRotation([0.0, 0.0, 1.0, float(yaw)])
+        if reset:
+            try:
+                node.resetPhysics()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _spawn_string_at(self, node_string, position, yaw=None):
+        field = self.sup.getRoot().getField("children")
+        field.importMFNodeFromString(-1, node_string)
+        node = field.getMFNode(field.getCount() - 1)
+        self._apply_move(node, position=position, yaw=yaw, reset=False)
+        return node
+
+    def _spawn_many(self, node_string, positions, yaw=None):
+        return [self._node_summary(self._spawn_string_at(node_string, pos, yaw))
+                for pos in positions]
+
+    def _occupied_aabbs(self, exclude_id=None):
+        out = []
+        for n in self._catalog_nodes():
+            if exclude_id is not None and n.getId() == exclude_id:
+                continue
+            ab = self._world_aabb(n)
+            if ab:
+                out.append(ab)
+        return out
+
+    def _support_aabbs(self, region, up):
+        """Occupied AABBs that could actually obstruct placement ON a support
+        plane: drop anything lying entirely at/below the region floor (e.g. the
+        ground/floor itself), which objects are meant to rest on, not avoid."""
+        floor_lvl = region[0][up]
+        return [a for a in self._occupied_aabbs() if a[1][up] > floor_lvl + 1e-4]
+
+    def _catalog_data(self, max_depth=3, with_flags=False):
+        rows = []
+        for node in self._catalog_nodes(max_depth):
+            e = self._catalog_entry(node)
+            if with_flags:
+                bo = node.getField("boundingObject")
+                e["has_bounding"] = bool(bo and bo.getType() == Field.SF_NODE
+                                         and bo.getSFNode())
+                pf = node.getField("physics")
+                e["has_physics"] = bool(pf and pf.getType() == Field.SF_NODE
+                                        and pf.getSFNode())
+            rows.append(e)
+        return rows
+
+    def cmd_drop_to_ground(self, p):
+        node = self.find_node(p["node"])
+        size = self._size_of(node)
+        if size is None:
+            raise ValueError("cannot determine object size (no boundingObject)")
+        up = int(p.get("up", 2))
+        pos = scene_math.drop_position(
+            list(node.getPosition()), size, self._occupied_aabbs(node.getId()),
+            floor=float(p.get("floor", 0.0)), up=up, gap=float(p.get("gap", 0.0)))
+        self._apply_move(node, position=pos)
+        return {"node": self._node_summary(node),
+                "position": [round(v, 4) for v in pos]}
+
+    def cmd_place_on(self, p):
+        node = self.find_node(p["node"])
+        target = self.find_node(p["target"])
+        size = self._size_of(node)
+        tab = self._world_aabb(target)
+        if size is None or tab is None:
+            raise ValueError("need bounding sizes for both node and target")
+        pos = scene_math.place_on_position(
+            size, tab, offset=p.get("offset") or [0.0, 0.0],
+            up=int(p.get("up", 2)), gap=float(p.get("gap", 0.0)))
+        self._apply_move(node, position=pos)
+        return {"node": self._node_summary(node),
+                "position": [round(v, 4) for v in pos]}
+
+    def cmd_align_objects(self, p):
+        nodes = [self.find_node(r) for r in p["nodes"]]
+        items = [{"id": n.getId(), "position": list(n.getPosition())} for n in nodes]
+        newpos = scene_math.align_positions(items, int(p["axis"]),
+                                            p.get("mode", "center"))
+        for n in nodes:
+            self._apply_move(n, position=newpos[n.getId()])
+        return {"aligned": {nid: [round(v, 4) for v in pos]
+                            for nid, pos in newpos.items()}}
+
+    def cmd_distribute_objects(self, p):
+        nodes = [self.find_node(r) for r in p["nodes"]]
+        items = [{"id": n.getId(), "position": list(n.getPosition())} for n in nodes]
+        newpos = scene_math.distribute_positions(
+            items, int(p["axis"]), spacing=p.get("spacing"), extent=p.get("extent"))
+        for n in nodes:
+            self._apply_move(n, position=newpos[n.getId()])
+        return {"distributed": {nid: [round(v, 4) for v in pos]
+                                for nid, pos in newpos.items()}}
+
+    def cmd_place_row(self, p):
+        positions = scene_math.row_positions(p["start"], p["step"], int(p["count"]))
+        return {"spawned": self._spawn_many(p["node_string"], positions, p.get("yaw"))}
+
+    def cmd_place_grid(self, p):
+        positions = scene_math.grid_positions(
+            p["start"], p["step_row"], p["step_col"], int(p["rows"]), int(p["cols"]))
+        return {"spawned": self._spawn_many(p["node_string"], positions, p.get("yaw"))}
+
+    def cmd_find_free_space(self, p):
+        near = self._resolve_point(p["near"]) if p.get("near") is not None else None
+        up = int(p.get("up", 2))
+        region = self._region(p["region"])
+        c = scene_math.find_free_space(
+            p["size"], region, self._support_aabbs(region, up),
+            up=up, near=near)
+        return {"found": c is not None,
+                "position": [round(v, 4) for v in c] if c else None}
+
+    def cmd_scatter_objects(self, p):
+        up = int(p.get("up", 2))
+        region = self._region(p["region"])
+        poses = scene_math.scatter_poses(
+            int(p["count"]), p["size"], region,
+            occupied=self._support_aabbs(region, up),
+            min_spacing=float(p.get("min_spacing", 0.0)), seed=p.get("seed"),
+            random_yaw=bool(p.get("random_yaw", True)), up=up)
+        spawned = None
+        if p.get("node_string"):
+            spawned = []
+            for pose in poses:
+                if pose is None:
+                    spawned.append(None)
+                    continue
+                n = self._spawn_string_at(p["node_string"], pose["position"], pose["yaw"])
+                spawned.append(self._node_summary(n))
+        return {"requested": int(p["count"]),
+                "placed": sum(1 for x in poses if x),
+                "poses": poses, "spawned": spawned}
+
+    def cmd_validate_world(self, p):
+        entries = self._catalog_data(with_flags=True)
+        state = self.cmd_get_simulation_state({})
+        arena = self._region(p["arena"]) if p.get("arena") else None
+        issues = scene_math.validate_world(
+            entries, floor=float(p.get("floor", 0.0)), up=int(p.get("up", 2)),
+            coordinate_system=state.get("coordinate_system", "ENU"), arena=arena)
+        by_sev = {}
+        for i in issues:
+            by_sev[i["severity"]] = by_sev.get(i["severity"], 0) + 1
+        return {"issues": issues, "count": len(issues), "by_severity": by_sev}
+
+    def _scene_snapshot(self):
+        snap = {}
+        for n in self._catalog_nodes():
+            e = self._catalog_entry(n)
+            snap[n.getId()] = {"name": e["name"] or e["def"], "position": e["position"],
+                               "yaw": e["yaw"], "size": e["size"]}
+        return snap
+
+    def cmd_snapshot_scene(self, p):
+        if not hasattr(self, "snapshots"):
+            self.snapshots = {}
+        name = str(p.get("name", "default"))
+        self.snapshots[name] = self._scene_snapshot()
+        return {"snapshot": name, "objects": len(self.snapshots[name])}
+
+    def cmd_diff_scene(self, p):
+        if not hasattr(self, "snapshots"):
+            self.snapshots = {}
+        a = self.snapshots.get(p["name_a"])
+        if a is None:
+            raise ValueError(f"no snapshot named {p['name_a']!r} (call snapshot_scene)")
+        b_name = p.get("name_b", "now")
+        b = self._scene_snapshot() if b_name == "now" else self.snapshots.get(b_name)
+        if b is None:
+            raise ValueError(f"no snapshot named {b_name!r}")
+        return scene_math.diff_snapshots(a, b)
+
+    def cmd_get_scene_map(self, p):
+        entries = self._catalog_data(with_flags=False)
+        svg = scene_math.svg_scene_map(
+            entries, up=int(p.get("up", 2)), width=int(p.get("width", 640)),
+            height=int(p.get("height", 640)))
+        return {"format": "svg", "objects": len(entries), "svg": svg}
+
+    # ======================================================================
+    # Commands: run / understand loop (P9, P1.2)
+    # ======================================================================
+
+    def _build_world(self, names):
+        """World snapshot for the condition DSL: positions, speeds, and
+        pairwise contacts among the named nodes."""
+        points = {}
+        world_nodes = {}
+        for name in names:
+            node = self.find_node(name)
+            pos = list(node.getPosition())
+            try:
+                vel = node.getVelocity()
+                speed = math.sqrt(sum(v * v for v in vel[:3]))
+            except Exception:  # noqa: BLE001
+                speed = 0.0
+            world_nodes[name] = {"position": [round(v, 5) for v in pos],
+                                 "speed": round(speed, 5), "contacts": set()}
+            try:
+                self._ensure_contact_tracking(node)
+                points[name] = [tuple(cp.point) for cp in node.getContactPoints(True)]
+            except Exception:  # noqa: BLE001
+                points[name] = []
+        eps = 1e-4
+        ns = list(points)
+        for i, a in enumerate(ns):
+            for b in ns[i + 1:]:
+                if any(abs(pa[0] - pb[0]) < eps and abs(pa[1] - pb[1]) < eps
+                       and abs(pa[2] - pb[2]) < eps
+                       for pa in points[a] for pb in points[b]):
+                    world_nodes[a]["contacts"].add(b)
+                    world_nodes[b]["contacts"].add(a)
+        return {"sim_time": round(self.sup.getTime(), 4), "nodes": world_nodes}
+
+    def cmd_wait_until(self, p):
+        cond = p["condition"]
+        names = sorted(run_analysis.referenced_nodes(cond))
+        timeout = float(p.get("timeout_s", 30.0))
+        max_steps = max(1, int(timeout * 1000 / self.timestep))
+        fired = False
+        steps = 0
+        world = self._build_world(names)
+        for _ in range(max_steps):
+            world = self._build_world(names)
+            if run_analysis.evaluate_condition(cond, world):
+                fired = True
+                break
+            if self.sup.step(self.timestep) == -1:
+                break
+            self._sample_tracking()
+            steps += 1
+        return {"fired": fired, "sim_time": round(self.sup.getTime(), 4),
+                "steps": steps, "condition": cond,
+                "poses": {n: world["nodes"][n]["position"] for n in names},
+                "reason": "condition met" if fired else "timeout"}
+
+    def cmd_detect_anomalies(self, p):
+        tr = self.tracking
+        if tr is None:
+            raise ValueError("tracking is not active; call start_tracking first")
+        buffers = {e["name"]: list(e["buf"]) for e in tr["nodes"].values()}
+        arena = self._region(p["arena"]) if p.get("arena") else None
+        an = run_analysis.detect_anomalies(
+            buffers, floor=float(p.get("floor", 0.0)), up=int(p.get("up", 2)),
+            arena=arena, teleport_thresh=float(p.get("teleport_thresh", 1.0)),
+            speed_thresh=float(p.get("speed_thresh", 50.0)))
+        return {"anomalies": an, "count": len(an)}
+
+    def cmd_run_experiment(self, p):
+        duration = float(p.get("duration_s", 5.0))
+        before = self._scene_snapshot()
+        self.cmd_save_checkpoint({"name": "_experiment"})
+        self.cmd_start_tracking({"nodes": p.get("watch"),
+                                 "sample_every": int(p.get("sample_every", 2))})
+        cond = p.get("until")
+        names = sorted(run_analysis.referenced_nodes(cond)) if cond else []
+        steps_total = max(1, int(duration * 1000 / self.timestep))
+        fired = False
+        i = 0
+        while i < steps_total:
+            if cond and run_analysis.evaluate_condition(cond, self._build_world(names)):
+                fired = True
+                break
+            if self.sup.step(self.timestep) == -1:
+                break
+            self._sample_tracking()
+            i += 1
+        tracking = self.cmd_get_tracking({"max_points": int(p.get("max_points", 30))})
+        buffers = {e["name"]: list(e["buf"]) for e in self.tracking["nodes"].values()}
+        arena = self._region(p["arena"]) if p.get("arena") else None
+        anomalies = run_analysis.detect_anomalies(
+            buffers, floor=float(p.get("floor", 0.0)), up=int(p.get("up", 2)),
+            arena=arena)
+        after = self._scene_snapshot()
+        diff = scene_math.diff_snapshots(before, after)
+        self.tracking = None
+        shot = None
+        if p.get("screenshot"):
+            try:
+                shot = self.cmd_screenshot({"quality": int(p.get("quality", 85))}).get("base64")
+            except Exception:  # noqa: BLE001
+                shot = None
+        restore = p.get("restore", "auto")
+        restored = False
+        if restore == "keep":
+            pass
+        elif restore == "on_anomaly":
+            if anomalies:
+                self.cmd_restore_checkpoint({"name": "_experiment"})
+                restored = True
+        else:
+            self.cmd_restore_checkpoint({"name": "_experiment"})
+            restored = True
+        return {"duration_s": duration, "fired": fired,
+                "sim_time": round(self.sup.getTime(), 4),
+                "objects": tracking["objects"],
+                "interactions": tracking["interactions"],
+                "diff": diff["summary"], "diff_detail": diff,
+                "anomalies": anomalies, "anomaly_count": len(anomalies),
+                "restored": restored, "restore_mode": restore,
+                "screenshot_base64": shot}
+
+    # ======================================================================
+    # Commands: authoring / script export (P8.4/8.5/8.7, P9.4, P10.1)
+    # ======================================================================
+
+    def _first_shape(self, node):
+        for n in self._iter_nodes(node, max_depth=5):
+            if n.getBaseTypeName() == "Shape":
+                return n
+        return None
+
+    def cmd_generate_world_script(self, p):
+        fmt = p.get("format", "python")
+        strings, objects = [], []
+        for n in self._catalog_nodes():
+            try:
+                s = n.exportString()
+            except Exception:  # noqa: BLE001
+                continue
+            strings.append(s)
+            e = self._catalog_entry(n)
+            objects.append({"name": e["name"], "def": e["def"],
+                            "position": e["position"], "node_string": s})
+        if fmt == "python":
+            return {"format": "python",
+                    "script": authoring.python_script_from_nodes(strings),
+                    "objects": len(strings)}
+        if fmt == "json":
+            state = self.cmd_get_simulation_state({})
+            phys = {"coordinate_system": state.get("coordinate_system"),
+                    "gravity": state.get("gravity"),
+                    "basic_time_step": self.timestep}
+            return {"format": "json",
+                    "scenario": authoring.json_scenario_from_objects(objects, physics=phys),
+                    "objects": len(objects)}
+        raise ValueError("format must be 'python' or 'json' (use save_world for 'wbt')")
+
+    def cmd_extract_proto_from_node(self, p):
+        node = self.find_node(p["node"])
+        s = node.exportString()
+        expose = tuple(p.get("expose") or ["translation", "rotation", "name"])
+        proto = authoring.wrap_proto(s, p["proto_name"], expose=expose)
+        return {"proto_name": p["proto_name"], "proto_text": proto}
+
+    def cmd_set_appearance(self, p):
+        node = self.find_node(p["node"])
+        shape = self._first_shape(node)
+        if shape is None:
+            raise ValueError("node has no Shape to style")
+        appf = shape.getField("appearance")
+        app = appf.getSFNode() if appf and appf.getType() == Field.SF_NODE else None
+        if p.get("base_color") is not None:
+            color = [float(v) for v in p["base_color"]]
+            if app is not None and app.getField("baseColor"):
+                app.getField("baseColor").setSFColor(color)
+            elif app is not None and app.getField("material") \
+                    and app.getField("material").getSFNode():
+                app.getField("material").getSFNode().getField("diffuseColor").setSFColor(color)
+            else:
+                raise ValueError("shape has no PBRAppearance/Appearance to recolor; "
+                                 "respawn it with an appearance node")
+        if p.get("roughness") is not None and app and app.getField("roughness"):
+            app.getField("roughness").setSFFloat(float(p["roughness"]))
+        if p.get("metalness") is not None and app and app.getField("metalness"):
+            app.getField("metalness").setSFFloat(float(p["metalness"]))
+        return {"styled": self._node_summary(shape)}
+
+    def cmd_set_recognition_colors(self, p):
+        node = self.find_node(p["node"])
+        f = node.getField("recognitionColors")
+        if f is None or f.getType() != Field.MF_COLOR:
+            raise ValueError("node has no recognitionColors field (not a Solid?)")
+        while f.getCount():
+            f.removeMF(0)
+        for c in p["colors"]:
+            f.insertMFColor(-1, [float(v) for v in c])
+        return {"node": self._node_summary(node), "colors": f.getCount()}
+
+    def cmd_configure_lighting(self, p):
+        preset = authoring.lighting_preset(p["preset"])
+        intensity = p.get("intensity")
+        changed = {}
+        for _, n in self._child_nodes(self.sup.getRoot()):
+            if n.getBaseTypeName() in ("Background",) and n.getField("skyColor"):
+                sk = n.getField("skyColor")
+                if sk.getCount():
+                    sk.setMFColor(0, preset["sky"])
+                else:
+                    sk.insertMFColor(-1, preset["sky"])
+                changed["background"] = preset["sky"]
+        root = self.sup.getRoot().getField("children")
+        added = 0
+        for spec in preset["lights"]:
+            root.importMFNodeFromString(-1, authoring._light_node(spec, intensity))
+            added += 1
+        changed["lights_added"] = added
+        return {"preset": p["preset"], "changed": changed}
+
+    def cmd_record_states(self, p):
+        nodes = ([self.find_node(r) for r in p["nodes"]] if p.get("nodes")
+                 else self._catalog_nodes())
+        fields = p.get("fields") or ["position"]
+        interval = int(p.get("interval_ms", self.timestep))
+        duration = float(p.get("duration_s", 3.0))
+        every = max(1, round(interval / self.timestep))
+        total = max(1, int(duration * 1000 / self.timestep))
+        names = {n.getId(): (self._node_summary(n).get("name")
+                             or self._node_summary(n).get("def") or str(n.getId()))
+                 for n in nodes}
+        rows = []
+        step = 0
+        while step < total:
+            if step % every == 0:
+                t = round(self.sup.getTime(), 4)
+                for n in nodes:
+                    row = {"sim_time": t, "node": names[n.getId()]}
+                    if "position" in fields:
+                        row["position"] = [round(v, 5) for v in n.getPosition()]
+                    try:
+                        vel = n.getVelocity()
+                    except Exception:  # noqa: BLE001
+                        vel = None
+                    if "velocity" in fields:
+                        row["velocity"] = [round(v, 5) for v in vel] if vel else None
+                    if "speed" in fields:
+                        row["speed"] = (round(math.sqrt(sum(x * x for x in vel[:3])), 5)
+                                        if vel else None)
+                    rows.append(row)
+            if self.sup.step(self.timestep) == -1:
+                break
+            self._sample_tracking()
+            step += 1
+        return {"rows": rows, "count": len(rows), "fields": fields,
+                "nodes": list(names.values())}
+
+    # ======================================================================
+    # Commands: physics config / profiling / scenarios (P5.2/8.8, 9.5, 10.3)
+    # ======================================================================
+
+    def cmd_configure_physics(self, p):
+        wi = self._world_info()
+        if wi is None:
+            raise ValueError("no WorldInfo node in this world")
+        # drop None values so recipe defaults aren't blocked by unset params
+        settings = {k: v for k, v in p.items() if k != "recipe" and v is not None}
+        if p.get("recipe"):
+            recipe = experiments.physics_recipe(p["recipe"])
+            for k, v in recipe.items():
+                settings.setdefault(k, v)
+        applied = {}
+        g = settings.get("gravity")
+        if g is not None:
+            f = wi.getField("gravity")
+            if f and f.getType() == Field.SF_VEC3F:
+                vec = ([float(v) for v in g] if isinstance(g, (list, tuple))
+                       else [0.0, 0.0, -abs(float(g))])
+                f.setSFVec3f(vec)
+                applied["gravity"] = vec
+            elif f and f.getType() == Field.SF_FLOAT:
+                # R2025a WorldInfo.gravity is a scalar magnitude; direction follows
+                # the coordinate system. Accept a vector (use its magnitude) or scalar.
+                mag = (sum(float(v) ** 2 for v in g) ** 0.5
+                       if isinstance(g, (list, tuple)) else abs(float(g)))
+                f.setSFFloat(mag)
+                applied["gravity"] = mag
+        for key, field_name, cast in (
+                ("basic_time_step", "basicTimeStep", float),
+                ("fps", "fps", float),
+                ("random_seed", "randomSeed", int),
+                ("optimal_thread_count", "optimalThreadCount", int)):
+            if settings.get(key) is not None:
+                f = wi.getField(field_name)
+                if f:
+                    val = cast(settings[key])
+                    (f.setSFFloat if cast is float else f.setSFInt32)(val)
+                    applied[key] = val
+        cs = wi.getField("coordinateSystem")
+        return {"applied": applied,
+                "coordinate_system": cs.getSFString() if cs else "ENU",
+                "note": "basicTimeStep/thread changes may need a world reset to "
+                        "fully take effect; set random_seed then reset for "
+                        "reproducible physics"}
+
+    def cmd_profile_simulation(self, p):
+        duration = float(p.get("duration_s", 3.0))
+        steps = max(1, int(duration * 1000 / self.timestep))
+        sim0 = self.sup.getTime()
+        wall0 = time.time()
+        done = 0
+        for _ in range(steps):
+            if self.sup.step(self.timestep) == -1:
+                break
+            self._sample_tracking()
+            done += 1
+        wall = time.time() - wall0
+        sim = self.sup.getTime() - sim0
+        rtf = (sim / wall) if wall > 0 else None
+        return {"sim_time_s": round(sim, 4), "wall_time_s": round(wall, 4),
+                "real_time_factor": round(rtf, 4) if rtf else None,
+                "steps": done,
+                "note": "achieved sim/wall ratio; < 1 means slower than real time "
+                        "(usually mesh bounding objects or a tiny timestep)"}
+
+    def cmd_build_scenario(self, p):
+        spawned = []
+        for op in p["ops"]:
+            n = self._spawn_string_at(op["node_string"], op["position"],
+                                      op.get("yaw"))
+            spawned.append(self._node_summary(n))
+        return {"spawned": spawned, "count": len(spawned)}
+
+    def cmd_get_viewport_labels(self, p):
+        vp = self._get_viewpoint()
+        pos = list(vp.getField("position").getSFVec3f())
+        rot = list(vp.getField("orientation").getSFRotation())
+        fov_f = vp.getField("fieldOfView")
+        fov = fov_f.getSFFloat() if fov_f else 0.785
+        m = perception.axis_angle_to_matrix(rot[:3], rot[3])
+        fwd, up = perception.camera_basis(m)
+        w = int(p.get("width", 640))
+        h = int(p.get("height", 480))
+        objs = [{"name": e["name"] or e["def"] or str(e["id"]),
+                 "position": e["position"]} for e in self._catalog_data()]
+        labels = perception.viewport_labels(objs, pos, fwd, up, fov, w, h)
+        return {"labels": labels, "count": len(labels), "width": w, "height": h,
+                "camera": {"position": [round(v, 4) for v in pos],
+                           "fov": round(fov, 4)},
+                "note": "occlusion-unaware: labels are for objects in front and "
+                        "inside the frame, sorted near to far"}
+
+    # ======================================================================
     # Commands: general / simulation
     # ======================================================================
 
     def cmd_ping(self, p):
         return {"pong": True, "time": self.sup.getTime()}
 
+    def _world_info(self):
+        """The WorldInfo node, or None."""
+        for _, n in self._child_nodes(self.sup.getRoot()):
+            if n.getBaseTypeName() == "WorldInfo":
+                return n
+        return None
+
     def cmd_get_simulation_state(self, p):
-        return {
+        state = {
             "time": self.sup.getTime(),
             "mode": self.logical_mode,
             "basic_time_step": self.timestep,
@@ -578,6 +1549,17 @@ class Bridge:
             "webots_version": os.environ.get("WEBOTS_VERSION", "unknown"),
             "registered_agents": list(self.agents.keys()),
         }
+        wi = self._world_info()
+        if wi is not None:
+            cs = wi.getField("coordinateSystem")
+            state["coordinate_system"] = cs.getSFString() if cs else "ENU"
+            g = wi.getField("gravity")
+            if g and g.getType() == Field.SF_VEC3F:
+                state["gravity"] = [round(v, 4) for v in g.getSFVec3f()]
+            rs = wi.getField("randomSeed")
+            if rs:
+                state["random_seed"] = rs.getSFInt32()
+        return state
 
     def cmd_set_simulation_mode(self, p):
         mode = p.get("mode")
@@ -708,6 +1690,19 @@ class Bridge:
             info["position"] = list(node.getPosition())
             info["orientation"] = list(node.getOrientation())
         except Exception:  # noqa: BLE001 - not all nodes have a pose
+            pass
+        try:
+            info["velocity"] = [round(v, 4) for v in node.getVelocity()]
+        except Exception:  # noqa: BLE001 - needs physics
+            pass
+        try:
+            self._ensure_contact_tracking(node)
+            info["contact_count"] = len(node.getContactPoints(True))
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            info["center_of_mass"] = [round(v, 4) for v in node.getCenterOfMass()]
+        except Exception:  # noqa: BLE001 - needs physics
             pass
         return info
 

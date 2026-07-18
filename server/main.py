@@ -18,8 +18,10 @@ from mcp.server.fastmcp import FastMCP  # noqa: E402
 
 import resources  # noqa: E402
 from connection import BridgeConnection  # noqa: E402
-from tools import (app, assets, batch, code_exec, diagnostics, manage, observe,  # noqa: E402
-                   robot, scene, sensing, simulation, world_files)
+from tools import (analyze, app, assets, authoring_tools, batch, behaviors,  # noqa: E402
+                   code_exec, diagnostics, dx, extern, experiments_tools, manage,
+                   observe, robot, scene, scene_model, sensing, simulation,
+                   world_build, world_files)
 
 logging.basicConfig(level=logging.INFO, stream=sys.stderr,
                     format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -46,6 +48,14 @@ bridge = BridgeConnection(
 # register per group so tool groups can be toggled via manage_tool_groups
 _GROUPED_MODULES = (
     ("core", (simulation, scene, sensing, robot, code_exec, batch, diagnostics)),
+    ("scene_model", (scene_model,)),
+    ("world_build", (world_build,)),
+    ("analyze", (analyze,)),
+    ("authoring", (authoring_tools,)),
+    ("experiments", (experiments_tools,)),
+    ("dx", (dx,)),
+    ("extern", (extern,)),
+    ("behavior", (behaviors,)),
     ("observe", (observe,)),
     ("app", (app, world_files)),
     ("assets", (assets,)),

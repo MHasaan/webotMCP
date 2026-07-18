@@ -1,7 +1,7 @@
 # Webots MCP
 
-Full-access MCP server for the [Webots](https://cyberbotics.com) robot simulator —
-modeled on Unity MCP. Lets an AI assistant see, understand, and modify a running
+Full-access MCP server for the [Webots](https://cyberbotics.com) robot simulator.
+Lets an AI assistant see, understand, and modify a running
 simulation: scene-tree inspection/editing, node spawning/deletion, viewport
 screenshots, simulation control, generic control of **any** robot (motors, sensors,
 cameras, LEDs, motions), and arbitrary code execution inside Webots.
@@ -22,14 +22,17 @@ mcp_robot  — generic agent controller, attachable to any robot (auto-discovers
 
 1. `pip install -r requirements.txt`
 2. Register the server with Claude Code (use this repo's actual path):
+
    ```
    claude mcp add webots -- python <path-to-this-repo>/server/main.py
    ```
+
    or add to `.mcp.json`:
    ```json
    { "mcpServers": { "webots": { "command": "python", "args": ["<path-to-this-repo>/server/main.py"] } } }
    ```
 3. Get a world with the bridge running — either:
+
    - ask for `launch_webots` (opens the bundled `worlds/demo.wbt`), or
    - for your own project: `install_bridge_into_world("path\\to\\your.wbt")`, then open it in Webots.
 
@@ -84,7 +87,127 @@ The MCP sees the scene **in motion**, not just as snapshots:
   one call (bulk spawning, mass field edits) with per-command results and
   `stop_on_error` control.
 - **MCP resources** — read-only live state at `webots://simulation`,
-  `webots://scene`, `webots://robots`, and `webots://scene/{node}`.
+  `webots://scene`, `webots://robots`, `webots://scene/{node}`, and
+  `webots://conventions` (units + this world's up-axis / coordinate system).
+
+## Semantic scene model (`scene_model` group)
+
+A ready-made semantic picture of the world instead of reconstructing it field by
+field:
+
+- `get_object_catalog()` — one inventory row per Solid/Robot: position, yaw, size
+  (from the boundingObject), mass, static|dynamic, color, parent. Paged.
+- `get_object_properties(node)` — deep single-object composite: full world AABB,
+  velocity, center of mass, static balance, contact partners, devices.
+- `get_contact_points(node)` / richer `get_node_details` (velocity, contact count,
+  CoM) / `reset_node_physics(node)` — stop a single runaway object.
+- Spatial queries: `find_nodes_near`, `objects_in_region`, `check_overlap`,
+  `find_overlapping_pairs`, `get_spatial_relations` (touching / on_top_of / inside /
+  near) — answer "what's on the table?" in one call.
+
+## World building (`world_build` group)
+
+Reliable authoring — no more objects spawned floating or intersecting:
+
+- `drop_to_ground(node)` / `place_on(node, target)` — rest an object on the support
+  beneath it or centered on another's top face.
+- `align_objects` / `distribute_objects` / `place_row` / `place_grid` — bulk layout.
+- `find_free_space(size, region)` / `scatter_objects(count, size, region, seed=...)`
+  — collision-aware placement + reproducible domain randomization.
+- `validate_world()` — static lint: overlaps, below-floor / floating objects,
+  dynamic nodes missing a boundingObject, duplicate DEFs, non-ENU warning.
+- `get_scene_map()` — top-down labeled vector SVG of the whole layout.
+- `snapshot_scene(name)` / `diff_scene(a, b='now')` — "what did my last edit change?"
+  (added / removed / moved / rotated).
+
+## Run & understand (`analyze` group)
+
+Turn "run it and see" into one structured, deterministic call:
+
+- `wait_until(condition, timeout_s)` — step until an event fires instead of
+  guessing a duration. Condition DSL: `distance`, `contact`, `speed`, `position`,
+  `sim_time`, plus `any`/`all` combinators. Returns when/where it fired.
+- `run_experiment(duration_s, watch=, until=, restore=)` — one iteration in one
+  call: checkpoint → track → run (for a duration or `until` a condition) → return a
+  run report (per-object motion + displacement, interaction timeline, scene diff vs
+  start, anomalies) → rewind (`auto` / `keep` / `on_anomaly`). Optional final image.
+- `detect_anomalies()` — over the currently-tracked motion: NaN/inf blow-ups,
+  teleports, runaway velocity, below-floor / out-of-arena — each with a fix hint.
+- `get_console_diagnostics()` / `get_controller_logs(robot)` — classify the Webots
+  console (ODE/physics, controller tracebacks, missing assets, parse warnings) with
+  fixes, and split logs per controller.
+
+## Authoring & automation (`authoring` group)
+
+Session → reusable assets and reproducible code:
+
+- `generate_world_script(format='python'|'json'|'wbt')` — export the current scene
+  as a standalone Supervisor script, a declarative scenario, or a clean world file.
+- `extract_proto_from_node(node, proto_name)` — turn a tuned node into a reusable
+  PROTO (exposes translation/rotation/name) written to the project protos/.
+- `create_world(name, template='empty'|'indoor_room'|'outdoor_flat')` — scaffold a
+  ready .wbt (base nodes only); `backup_world` / `list_world_backups` /
+  `restore_world_backup` — managed edit history.
+- `list_appearances` / `set_appearance(node, base_color=)` / `set_recognition_colors`
+  — style shapes and make objects visible to camera recognition in one call.
+- `configure_lighting(preset='indoor'|'outdoor'|'studio'|'night')` — fix the top
+  cause of useless screenshots and failed recognition.
+- `record_states(duration_s, nodes=, fields=)` — record motion to a CSV file (with
+  summary stats) for offline analysis and regression tests.
+
+## Experiments & scenarios (`experiments` group)
+
+- `configure_physics(recipe=|gravity=|basic_time_step=|random_seed=|fps=)` — set
+  WorldInfo without field paths; recipes: earth/moon/mars/zero_g/slow_motion/
+  high_fidelity. Set `random_seed` (then reset) for reproducible physics.
+- `profile_simulation(duration_s)` — achieved sim/wall real-time factor;
+  `profile_from_log(path)` parses a `--log-performance` file.
+- `compare_runs(report_a, report_b)` — per-object end-position divergence between
+  two run_experiment reports ("it fails one time in five").
+- `save_scenario(name)` / `load_scenario(file, seed=)` / `run_scenario(file, runs=,
+  seeds=)` — capture the world as a versionable scenario.json (objects + physics +
+  wait_until conditions + duration), rebuild it deterministically, and batch
+  build→run→report across seeds with a divergence comparison.
+
+## Developer experience (`dx` group)
+
+- `get_viewport_labels()` — project every object into the CURRENT 3D view and get
+  pixel-space labels (near→far, in-frame); overlay them on get_viewport_screenshot.
+- `describe_sample(path)` / `list_sample_worlds(query)` — summarize any world file
+  (version, timestep, coordinate system, robots + controllers) and browse the
+  installed Webots sample/benchmark worlds.
+- `update_world_file(path)` / `clear_webots_cache()` — migrate old worlds and clear
+  the asset cache via the Webots CLI.
+- **Workflow prompts** — `inspect_scene`, `robot_bringup`, `record_demo`,
+  `experiment_loop`: proven multi-step recipes the client can invoke directly.
+- **Resource** `webots://console` — the last 50 lines of the Webots console.
+
+## Extern controllers & asset import (`extern` group)
+
+Debug the user's real code and pull in assets without touching the world file:
+
+- `run_extern_controller(controller_path, robot)` / `get_extern_controller_output`
+  / `stop_extern_controller` — set the robot's controller to `<extern>` and run any
+  controller file as an external process, capturing its stdout: the
+  edit→run→read→iterate controller-development loop.
+- `create_supervisor_script(name, code)` / `run_supervisor_script(name, robot)` —
+  scaffold and run full-speed Supervisor automation as an extern controller.
+- `import_cad_model(url, physics=, bounding_box=)` — drop an .obj/.dae mesh into the
+  scene as a CadShape Solid.
+- `convert_proto(proto_file)` — flatten an opaque PROTO to base nodes (headless).
+
+## High-level robot behaviors (`behavior` group)
+
+One tool call = one closed-loop behavior (no micro-managing wheel velocities):
+
+- `drive_robot(robot, linear, angular, duration_s)` — differential-drive
+  convenience; auto-pairs wheel motors, converts (v, ω) → wheel speeds, runs and
+  stops, returns start/end pose + distance.
+- `move_robot_to(robot, target, tolerance)` — closed-loop go-to-point via a
+  heading controller over ground-truth pose (straight-line reactive, not a
+  planner).
+- `build_occupancy_grid(robot, resolution, size)` — rasterize a lidar scan + pose
+  into an ASCII occupancy map + world-frame obstacle list.
 
 ## Ground-truth perception
 

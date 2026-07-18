@@ -36,7 +36,8 @@ def install_bridge(wp: Path, copy_controllers: bool = True) -> list:
             src = MCP_ROOT / "controllers" / name
             dst = ctrl_dst / name
             dst.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src / f"{name}.py", dst / f"{name}.py")
+            for py_file in src.glob("*.py"):
+                shutil.copy2(py_file, dst / py_file.name)
             actions.append(f"copied controller {name} -> {dst}")
     return actions
 

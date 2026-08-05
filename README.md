@@ -28,6 +28,7 @@ mcp_robot  — generic agent controller, attachable to any robot (auto-discovers
    ```
 
    or add to `.mcp.json`:
+
    ```json
    { "mcpServers": { "webots": { "command": "python", "args": ["<path-to-this-repo>/server/main.py"] } } }
    ```
@@ -164,8 +165,7 @@ Session → reusable assets and reproducible code:
   `profile_from_log(path)` parses a `--log-performance` file.
 - `compare_runs(report_a, report_b)` — per-object end-position divergence between
   two run_experiment reports ("it fails one time in five").
-- `save_scenario(name)` / `load_scenario(file, seed=)` / `run_scenario(file, runs=,
-  seeds=)` — capture the world as a versionable scenario.json (objects + physics +
+- `save_scenario(name)` / `load_scenario(file, seed=)` / `run_scenario(file, runs=, seeds=)` — capture the world as a versionable scenario.json (objects + physics +
   wait_until conditions + duration), rebuild it deterministically, and batch
   build→run→report across seeds with a divergence comparison.
 
@@ -293,7 +293,8 @@ Webots cameras can report *what they see* — no ML needed:
 - Pausing from the **Webots GUI** blocks the bridge until resumed; prefer the
   `set_simulation_mode` tool.
 - Viewport screenshots capture the 3D view as rendered — keep the Webots window
-  reasonably large and unobstructed for useful images.
+  reasonably large and unobstructed for useful images, may need to change view port
+  camera to a better position manually for better scene context and understanding.
 - `attach_mcp_controller` replaces the robot's own controller (the previous name is
   returned; restore it with `set_node_field(robot, "controller", old_name)` +
   `execute_supervisor_code` restartController if needed).

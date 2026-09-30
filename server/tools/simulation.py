@@ -8,7 +8,8 @@ def register(mcp, bridge):
     def world_reload() -> dict:
         """Reload the current world from its .wbt file, discarding runtime changes.
         All controllers (including the MCP bridge) restart — expect a brief
-        disconnect; the connection recovers automatically."""
+        disconnect. If the reply is lost, an unknown-outcome error is returned;
+        the next command reconnects. Inspect state before retrying the reload."""
         return bridge.command("world_reload")
 
     @mcp.tool()
@@ -29,7 +30,8 @@ def register(mcp, bridge):
     @mcp.tool()
     def step_simulation(steps: int = 1) -> dict:
         """Advance the simulation by N basic time steps (useful while paused to
-        move time forward deterministically)."""
+        move time forward deterministically). N must be an integer in 0..100000;
+        invalid counts are rejected before stepping."""
         return bridge.command("step_simulation", {"steps": steps}, timeout=300.0)
 
     @mcp.tool()

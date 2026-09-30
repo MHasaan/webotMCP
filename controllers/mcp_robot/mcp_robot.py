@@ -17,7 +17,9 @@ import socket
 import struct
 import sys
 import tempfile
+import time
 import traceback
+import weakref
 
 # Webots sets WEBOTS_HOME for controller processes it spawns.
 for _home in filter(None, (os.environ.get("WEBOTS_HOME"),
@@ -32,6 +34,8 @@ for _home in filter(None, (os.environ.get("WEBOTS_HOME"),
 from controller import Robot, Motion  # noqa: E402
 
 AGENT_PORT = int(os.environ.get("WEBOTS_MCP_AGENT_PORT", "10023"))
+MAX_FRAME = 64 * 1024 * 1024
+_FRAME_BUFFERS = weakref.WeakKeyDictionary()
 
 # Webots device node-type name -> category
 SENSOR_TYPES = {
@@ -52,25 +56,35 @@ def send_frame(sock, obj):
 
 def recv_frame_nonblocking(sock):
     """Return a frame if one is fully available, else None. Raises on disconnect."""
+    buf = _FRAME_BUFFERS.setdefault(sock, bytearray())
+    previous_timeout = sock.gettimeout()
     sock.setblocking(False)
     try:
-        header = sock.recv(4, socket.MSG_PEEK)
+        while True:
+            target = 4
+            if len(buf) >= 4:
+                length, = struct.unpack(">I", buf[:4])
+                if not 0 < length <= MAX_FRAME:
+                    raise ValueError(f"invalid frame length: {length}")
+                target += length
+            if len(buf) == target and target > 4:
+                data = bytes(buf[4:])
+                buf.clear()
+                req = json.loads(data.decode("utf-8"))
+                if not isinstance(req, dict):
+                    raise ValueError("command must be a JSON object")
+                return req
+            chunk = sock.recv(target - len(buf))
+            if not chunk:
+                raise ConnectionError("bridge closed connection")
+            buf.extend(chunk)
     except BlockingIOError:
         return None
+    except (OSError, ValueError):
+        _FRAME_BUFFERS.pop(sock, None)
+        raise
     finally:
-        sock.setblocking(True)
-    if header == b"":
-        raise ConnectionError("bridge closed connection")
-    if len(header) < 4:
-        return None
-    (length,) = struct.unpack(">I", sock.recv(4))
-    buf = b""
-    while len(buf) < length:
-        chunk = sock.recv(length - len(buf))
-        if not chunk:
-            raise ConnectionError("bridge closed connection mid-frame")
-        buf += chunk
-    return json.loads(buf.decode("utf-8"))
+        sock.settimeout(previous_timeout)
 
 
 class Agent:
@@ -95,17 +109,37 @@ class Agent:
 
     def _connect(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        sock.connect(("127.0.0.1", AGENT_PORT))
-        send_frame(sock, {"register": self.name})
-        # blocking read of ack
-        header = b""
-        while len(header) < 4:
-            header += sock.recv(4 - len(header))
-        (length,) = struct.unpack(">I", header)
-        buf = b""
-        while len(buf) < length:
-            buf += sock.recv(length - len(buf))
+        deadline = time.monotonic() + 5.0
+        def remaining():
+            budget = deadline - time.monotonic()
+            if budget <= 0:
+                raise TimeoutError("agent registration deadline expired")
+            return budget
+        def exact(n):
+            buf = bytearray()
+            while len(buf) < n:
+                sock.settimeout(remaining())
+                chunk = sock.recv(n - len(buf))
+                if not chunk:
+                    raise ConnectionError("bridge closed during agent registration")
+                buf.extend(chunk)
+            return buf
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            sock.settimeout(remaining())
+            sock.connect(("127.0.0.1", AGENT_PORT))
+            sock.settimeout(remaining())
+            send_frame(sock, {"register": self.name})
+            length, = struct.unpack(">I", exact(4))
+            if not 0 < length <= MAX_FRAME:
+                raise ValueError(f"invalid registration frame length: {length}")
+            ack = json.loads(exact(length).decode("utf-8"))
+            if not isinstance(ack, dict) or ack.get("status") != "ok":
+                raise ConnectionError("bridge rejected agent registration")
+            sock.settimeout(None)
+        except (OSError, ValueError):
+            sock.close()
+            raise
         print(f"[mcp_robot:{self.name}] registered with bridge", flush=True)
         return sock
 
@@ -113,15 +147,17 @@ class Agent:
 
     def run(self):
         while self.robot.step(self.timestep) != -1:
+            if self.sock is None:
+                try:
+                    self.sock = self._connect()
+                except (OSError, ValueError):
+                    continue
             while True:
                 try:
                     req = recv_frame_nonblocking(self.sock)
-                except ConnectionError:
+                except (OSError, ValueError):
                     print(f"[mcp_robot:{self.name}] bridge disconnected; retrying", flush=True)
-                    try:
-                        self.sock = self._connect()
-                    except OSError:
-                        pass
+                    self._disconnect()
                     break
                 if req is None:
                     break
@@ -133,7 +169,21 @@ class Agent:
                     resp = {"id": req.get("id"), "status": "error",
                             "error": f"{type(exc).__name__}: {exc}",
                             "traceback": traceback.format_exc(limit=4)}
-                send_frame(self.sock, resp)
+                try:
+                    self.sock.settimeout(5.0)
+                    send_frame(self.sock, resp)
+                    self.sock.settimeout(None)
+                except OSError:
+                    # The operation may have completed. Never execute it again
+                    # to compensate for a lost reply; reconnect on the next step.
+                    self._disconnect()
+                    break
+
+    def _disconnect(self):
+        if self.sock is not None:
+            _FRAME_BUFFERS.pop(self.sock, None)
+            self.sock.close()
+            self.sock = None
 
     def dispatch(self, action, p):
         handler = getattr(self, "cmd_" + str(action), None)

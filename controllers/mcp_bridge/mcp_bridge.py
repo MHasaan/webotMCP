@@ -22,6 +22,7 @@ import json
 import math
 import os
 import queue
+import select
 import socket
 import struct
 import sys
@@ -65,22 +66,31 @@ def send_frame(sock, obj):
     sock.sendall(struct.pack(">I", len(data)) + data)
 
 
-def recv_frame(sock):
-    header = _recv_exact(sock, 4)
+def recv_frame(sock, deadline=None):
+    header = _recv_exact(sock, 4, deadline)
     if header is None:
         return None
     (length,) = struct.unpack(">I", header)
     if length > MAX_FRAME:
         raise ValueError(f"frame too large: {length}")
-    data = _recv_exact(sock, length)
+    data = _recv_exact(sock, length, deadline)
     if data is None:
         return None
     return json.loads(data.decode("utf-8"))
 
 
-def _recv_exact(sock, n):
-    buf = b""
+def _remaining(deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("agent command deadline expired")
+    return remaining
+
+
+def _recv_exact(sock, n, deadline=None):
+    buf = bytearray()
     while len(buf) < n:
+        if deadline is not None:
+            sock.settimeout(_remaining(deadline))
         chunk = sock.recv(n - len(buf))
         if not chunk:
             return None
@@ -189,6 +199,7 @@ class Bridge:
         self._contact_tracked = set()  # node ids with contact-points tracking enabled
         self.commands = queue.Queue()  # (request dict, reply callable)
         self.agents = {}  # robot name -> {"sock": socket, "lock": Lock}
+        self._agents_lock = threading.Lock()
         self._start_server(COMMAND_PORT, self._client_thread)
         self._start_server(AGENT_PORT, self._agent_thread)
         print(f"[mcp_bridge] command port {COMMAND_PORT}, agent port {AGENT_PORT}", flush=True)
@@ -259,29 +270,48 @@ class Bridge:
 
     def _agent_thread(self, conn):
         """An mcp_robot agent registering itself."""
+        name = None
+        agent = {"sock": conn, "lock": threading.Lock()}
         try:
-            reg = recv_frame(conn)
-            if not reg or "register" not in reg:
-                conn.close()
+            reg = recv_frame(conn, time.monotonic() + 5.0)
+            if not isinstance(reg, dict) or not isinstance(reg.get("register"), str):
                 return
             name = reg["register"]
-            self.agents[name] = {"sock": conn, "lock": threading.Lock()}
+            with agent["lock"]:
+                conn.settimeout(5.0)
+                send_frame(conn, {"status": "ok"})
+                with self._agents_lock:
+                    old = self.agents.get(name)
+                    self.agents[name] = agent
+                if old is not None:
+                    old["sock"].close()
             print(f"[mcp_bridge] agent registered: {name}", flush=True)
-            send_frame(conn, {"status": "ok"})
             # Keep the thread alive to detect disconnect (agent only speaks when asked).
             while True:
                 time.sleep(1.0)
                 if conn.fileno() == -1:
                     break
-        except (ConnectionError, OSError):
+                if not agent["lock"].acquire(blocking=False):
+                    continue  # A command owns reads and its deadline.
+                try:
+                    if select.select([conn], [], [], 0)[0]:
+                        if conn.recv(1, socket.MSG_PEEK) == b"":
+                            break
+                finally:
+                    agent["lock"].release()
+        except (OSError, ValueError):
             pass
         finally:
-            for k, v in list(self.agents.items()):
-                if v["sock"] is conn:
-                    del self.agents[k]
-                    print(f"[mcp_bridge] agent disconnected: {k}", flush=True)
+            with self._agents_lock:
+                if self.agents.get(name) is agent:
+                    del self.agents[name]
+                    print(f"[mcp_bridge] agent disconnected: {name}", flush=True)
+            conn.close()
 
     def call_agent(self, robot_name, action, params, timeout=30.0):
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout must be finite and positive")
+        deadline = time.monotonic() + timeout
         agent = self.agents.get(robot_name)
         if not agent:
             available = list(self.agents.keys())
@@ -289,19 +319,36 @@ class Bridge:
                 f"no mcp_robot agent registered for '{robot_name}'. "
                 f"Registered agents: {available}. Use attach_mcp_controller first."
             )
-        with agent["lock"]:
+        if not agent["lock"].acquire(timeout=_remaining(deadline)):
+            raise TimeoutError("agent command deadline expired waiting for lock; not sent")
+        try:
             sock = agent["sock"]
-            sock.settimeout(timeout)
             agent["req_id"] = agent.get("req_id", 0) + 1
             req_id = agent["req_id"]
-            send_frame(sock, {"id": req_id, "action": action, "params": params})
-            while True:
-                resp = recv_frame(sock)
+            data = json.dumps({"id": req_id, "action": action, "params": params}).encode("utf-8")
+            if len(data) > MAX_FRAME:
+                raise ValueError("agent command frame too large")
+            try:
+                sock.settimeout(_remaining(deadline))
+                sock.sendall(struct.pack(">I", len(data)) + data)
+                resp = recv_frame(sock, deadline)
                 if resp is None:
                     raise ConnectionError(f"agent '{robot_name}' closed the connection")
-                if resp.get("id") == req_id:
-                    return resp
-                # stale reply from a previously timed-out request: discard
+                if (not isinstance(resp, dict) or type(resp.get("id")) is not int
+                        or resp["id"] != req_id or resp.get("status") not in ("ok", "error")):
+                    raise ValueError("invalid agent response envelope or mismatched response ID")
+                return resp
+            except (OSError, ValueError) as exc:
+                sock.close()
+                with self._agents_lock:
+                    if self.agents.get(robot_name) is agent:
+                        del self.agents[robot_name]
+                raise ConnectionError(
+                    f"Agent '{robot_name}' command '{action}' outcome unknown: {exc}. "
+                    "It may already have executed; timeout does not cancel it. Not retried."
+                ) from exc
+        finally:
+            agent["lock"].release()
 
     # -- main loop ----------------------------------------------------------
 
@@ -1577,10 +1624,12 @@ class Bridge:
         return {"mode": mode}
 
     def cmd_step_simulation(self, p):
-        steps = int(p.get("steps", 1))
-        for _ in range(min(steps, 100000)):
+        steps = p.get("steps", 1)
+        if type(steps) is not int or not 0 <= steps <= 100000:
+            raise ValueError("steps must be an integer between 0 and 100000")
+        for completed in range(steps):
             if self.sup.step(self.timestep) == -1:
-                return {"stepped": True, "terminated": True}
+                return {"stepped": completed, "terminated": True}
             self._sample_tracking()
         return {"stepped": steps, "time": self.sup.getTime()}
 

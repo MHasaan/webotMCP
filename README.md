@@ -299,6 +299,10 @@ Webots cameras can report *what they see* — no ML needed:
 
 ## Notes & limitations
 
+- Commands are never replayed automatically after a lost reply. An “outcome
+  unknown” error means the operation may already have executed; timeout does not
+  cancel it. The next command reconnects. See [transport reliability and audit](docs/transport-reliability.md)
+  for deadline, reload, agent, and step-count behavior.
 - The Webots installation is auto-detected (WEBOTS_HOME env var → Windows registry →
   `webots` on PATH → standard install locations on Windows/Linux/macOS). Set
   `WEBOTS_HOME` explicitly only for unusual install paths.

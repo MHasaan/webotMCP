@@ -8,7 +8,11 @@ def register(mcp, bridge):
         """Run arbitrary Python inside the Webots supervisor bridge. Available names:
         'supervisor' (Supervisor instance — full scene/simulation API), 'Node',
         'Field'. Assign to 'result' to return a value; print() output is captured.
-        Example: result = supervisor.getFromDef('MY_BOT').getPosition()"""
+        Example: result = supervisor.getFromDef('MY_BOT').getPosition()
+        Node.getFromProtoDef requires an actual DEF inside that PROTO, not a
+        device's name field. Missing DEF searches can be expensive: do not
+        repeat speculative lookups in observation loops. Keep unavailable
+        optional data explicit rather than substituting unrelated nodes."""
         return bridge.command("execute_code", {"code": code}, timeout=120.0)
 
     @mcp.tool()

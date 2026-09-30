@@ -58,6 +58,23 @@ Beyond the loaded world, the MCP controls the Webots application itself:
 
 ## Dynamic scene observation
 
+### DEF names and device names
+
+`Node.getFromProtoDef()` searches DEF declarations inside a PROTO. A device's
+`name` field is a different identifier. Check the model before using that API;
+do not repeatedly probe nonexistent DEFs during scene observation.
+
+For example, a PR2 vacuum integration queried `r_vacuum_gripper` and
+`l_vacuum_gripper` as DEFs even though the model declared only device names.
+Both returned null, but together took about 47–52 seconds per scene read on
+the measured Webots R2025a setup. Omitting those unavailable optional lookups
+reduced scene-code execution to approximately 0.04 seconds. Preserve required
+measurements and validate the result; substituting wrist coordinates would
+misrepresent the vacuum-head pose.
+
+Use known node handles where available. Any handles cached by integration code
+must be refreshed after world reload or relevant PROTO regeneration.
+
 The MCP sees the scene **in motion**, not just as snapshots:
 
 - `watch_simulation(duration_s)` — run the sim and get a motion digest: every

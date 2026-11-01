@@ -234,6 +234,22 @@ DEF FLOOR Solid {{
             raise FileNotFoundError(f"no Webots config found in {conf_dir}")
         return confs[-1]
 
+    def _linux_conf(conf):
+        """Webots' Qt INI file: case-sensitive keys, no % interpolation. Earlier
+        lower-cased writes left case-duplicate keys; tolerate them on read."""
+        import configparser
+        cp = configparser.ConfigParser(interpolation=None, strict=False)
+        cp.optionxform = str
+        cp.read(conf, encoding="utf-8")
+        return cp
+
+    def _qt_group(name):
+        # Qt keeps keys outside any group in '%General', not 'General'.
+        return "%General" if name == "General" else name
+
+    def _pref_group(section):
+        return "General" if section == "%General" else section
+
     @mcp.tool()
     def get_webots_preferences() -> dict:
         """Read the Webots application preferences (startup mode, python command,
@@ -259,10 +275,9 @@ DEF FLOOR Solid {{
                 _read_values(key_path, "")
                 return {"source": f"HKCU\\{key_path}", "preferences": prefs}
             conf = _linux_pref_file()
-            import configparser
-            cp = configparser.ConfigParser()
-            cp.read(conf)
-            prefs = {f"{s}/{k}": v for s in cp.sections() for k, v in cp[s].items()}
+            cp = _linux_conf(conf)
+            prefs = {f"{_pref_group(s)}/{k}": v for s in cp.sections()
+                     for k, v in cp[s].items()}
             return {"source": str(conf), "preferences": prefs}
         except FileNotFoundError as exc:
             return {"error": str(exc),
@@ -283,13 +298,12 @@ DEF FLOOR Solid {{
                 winreg.SetValueEx(key, leaf, 0, winreg.REG_SZ, str(value))
         else:
             conf = _linux_pref_file()
-            import configparser
-            cp = configparser.ConfigParser()
-            cp.read(conf)
-            section, _, key = name.partition("/")
+            cp = _linux_conf(conf)
+            group, _, key = name.partition("/")
+            section = _qt_group(group)
             if not cp.has_section(section):
                 cp.add_section(section)
             cp[section][key] = str(value)
             with open(conf, "w", encoding="utf-8") as fh:
-                cp.write(fh)
+                cp.write(fh, space_around_delimiters=False)
         return {"set": name, "value": value, "note": "applies on next Webots launch"}

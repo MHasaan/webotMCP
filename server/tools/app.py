@@ -2,6 +2,7 @@
 
 import collections
 import os
+import signal
 import re
 import subprocess
 import sys
@@ -21,6 +22,18 @@ def _pump(stream):
     for line in iter(stream.readline, ""):
         _state["log"].append(line.rstrip())
     stream.close()
+
+
+def _signal_tree(proc, kill: bool):
+    """Stop the launched Webots and everything it started. On POSIX the launcher
+    script is not webots-bin itself, so signal the whole process group."""
+    if sys.platform != "win32":
+        try:
+            os.killpg(proc.pid, signal.SIGKILL if kill else signal.SIGTERM)
+            return
+        except (ProcessLookupError, PermissionError):
+            pass
+    proc.kill() if kill else proc.terminate()
 
 
 def _hide_camera_overlays(world: Path):
@@ -116,11 +129,14 @@ def register(mcp, bridge):
         # let Webots find our controllers even for foreign worlds
         extra = str(MCP_ROOT)
         prev = env.get("WEBOTS_EXTRA_PROJECT_PATH", "")
-        env["WEBOTS_EXTRA_PROJECT_PATH"] = f"{extra};{prev}" if prev else extra
+        env["WEBOTS_EXTRA_PROJECT_PATH"] = f"{extra}{os.pathsep}{prev}" if prev else extra
         _state["log"].clear()
+        # On Linux/macOS `webots` is a launcher script that starts webots-bin;
+        # a session of its own lets quit_webots stop the whole tree.
         proc = subprocess.Popen(args, env=env, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True,
-                                encoding="utf-8", errors="replace")
+                                encoding="utf-8", errors="replace",
+                                start_new_session=sys.platform != "win32")
         _state["proc"] = proc
         threading.Thread(target=_pump, args=(proc.stdout,), daemon=True).start()
         if not (minimized or fullscreen or no_rendering):
@@ -155,17 +171,17 @@ def register(mcp, bridge):
         if proc is None or proc.poll() is not None:
             return {"quit": False, "reason": "no Webots process launched by this server"}
         if force:
-            proc.kill()
+            _signal_tree(proc, kill=True)
         else:
             try:
                 bridge.command("execute_code", {"code": "supervisor.simulationQuit(0)"},
                                timeout=10.0)
             except Exception:  # noqa: BLE001
-                proc.terminate()
+                _signal_tree(proc, kill=False)
         try:
             proc.wait(timeout=15)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            _signal_tree(proc, kill=True)
         _state["proc"] = None
         bridge.close()
         return {"quit": True}

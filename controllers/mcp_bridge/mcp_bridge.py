@@ -194,6 +194,17 @@ class Bridge:
         self.sup = Supervisor()
         self.timestep = int(self.sup.getBasicTimeStep())
         self.logical_mode = "realtime"
+        # A paused bridge never steps, so it never saw step() return -1 after a
+        # simulationQuit() (the MCP server's graceful quit) and Webots logged
+        # "Forced termination" one second later (2026-11-20). Note the request
+        # so run() steps once more and exits.
+        self.quit_requested = False
+        real_quit = self.sup.simulationQuit
+
+        def simulation_quit(status, _real=real_quit):
+            self.quit_requested = True
+            _real(status)
+        self.sup.simulationQuit = simulation_quit
         # motion/interaction tracking state
         self.tracking = None  # {"nodes": {id: {"node", "name", "buf"}}, "sample_every", "events", "prev_contacts", "count"}
         self._contact_tracked = set()  # node ids with contact-points tracking enabled
@@ -360,12 +371,15 @@ class Bridge:
         self.logical_mode = "realtime"
         while True:
             self._drain_commands()
-            if self.logical_mode == "pause":
+            if self.logical_mode == "pause" and not self.quit_requested:
                 time.sleep(0.02)
                 continue
             if self.sup.step(self.timestep) == -1:
                 break
             self._sample_tracking()
+        # Webots is quitting and kills a controller still running 1 s from now;
+        # let the client thread send the reply to the quit command first.
+        time.sleep(0.2)
 
     # -- motion / interaction tracking ------------------------------------
 
@@ -2094,12 +2108,30 @@ class Bridge:
         # rotation matrix columns are the camera basis
         r = [[x[0], y[0], z[0]], [x[1], y[1], z[1]], [x[2], y[2], z[2]]]
         trace = r[0][0] + r[1][1] + r[2][2]
-        angle = math.acos(max(-1.0, min(1.0, (trace - 1.0) / 2.0)))
+        cos_a = max(-1.0, min(1.0, (trace - 1.0) / 2.0))
+        angle = math.acos(cos_a)
         if angle < 1e-6:
             return [0.0, 0.0, 1.0, 0.0]
-        s = 2.0 * math.sin(angle)
-        axis = [(r[2][1] - r[1][2]) / s, (r[0][2] - r[2][0]) / s,
-                (r[1][0] - r[0][1]) / s]
+        skew = [r[2][1] - r[1][2], r[0][2] - r[2][0], r[1][0] - r[0][1]]
+        if angle < math.pi - 1e-3:
+            s = 2.0 * math.sin(angle)
+            axis = [v / s for v in skew]
+        else:
+            # A camera looking back along -x is turned exactly 180 deg, whatever
+            # its pitch: the skew part vanishes and dividing by sin(angle) gave
+            # the axis [0, 0, 0], which Webots rejects ("invalid values for the
+            # [x y z] axis", 2026-11-20). Take the axis from the symmetric part,
+            # R + R^T = 2 cos(a) I + 2 (1 - cos(a)) n n^T.
+            k = max(range(3), key=lambda i: r[i][i])
+            axis = [0.0, 0.0, 0.0]
+            axis[k] = math.sqrt(max(0.0, (r[k][k] - cos_a) / (1.0 - cos_a)))
+            for i in range(3):
+                if i != k:
+                    axis[i] = (r[i][k] + r[k][i]) / (2.0 * (1.0 - cos_a) * axis[k])
+            if sum(a * b for a, b in zip(axis, skew)) < 0.0:
+                axis = [-v for v in axis]
+            n = math.sqrt(sum(v * v for v in axis))
+            axis = [v / n for v in axis]
         return [round(v, 5) for v in (*axis, angle)]
 
     def _get_viewpoint(self):
